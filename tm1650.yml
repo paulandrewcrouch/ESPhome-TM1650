@@ -1,0 +1,588 @@
+substitutions:
+  dev_name: "tm1650-display"
+
+esphome:
+  name: ${dev_name}
+  friendly_name: "TM1650 Display"
+  on_boot:
+    priority: -10
+    then:
+      - lambda: |-
+          id(disp_mode) = 0;     // clock
+          id(text_payload) = ""; // nothing queued
+
+esp8266:
+  board: esp01_1m
+
+logger:
+  level: DEBUG
+api:
+ota:
+  - platform: esphome
+
+captive_portal:
+web_server:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+
+# ---------- Time (SNTP + HA) ----------
+time:
+  - platform: sntp
+    id: tm_ntp
+    timezone: "Europe/London"
+    servers:
+      - 131.111.8.28
+    on_time_sync:
+      then:
+        - lambda: |-
+            id(last_ntp_ms) = millis();
+  - platform: homeassistant
+    id: tm_hass
+
+i2c:
+  sda: 13
+  scl: 12
+  frequency: 50000
+  scan: true
+
+# ---------- MQTT (disable discovery to avoid duplicates) ----------
+mqtt:
+  broker: 192.168.1.1
+  port: 1883
+  client_id: ${dev_name}
+  username: ${dev_name}
+  password: "password"
+  topic_prefix: ${dev_name}
+  discovery: false
+
+  on_connect:
+    then:
+      - lambda: 'id(mqtt_ok) = true;'
+  on_disconnect:
+    then:
+      - lambda: 'id(mqtt_ok) = false;'
+
+  on_message:
+    # ---- RTTTL direct control ----
+    # Play any RTTTL string in payload
+    - topic: ${dev_name}/rtttl
+      then:
+        - lambda: |-
+            if (!id(buzzer_enabled)) return;
+            id(buzzer_rtttl).play(x.c_str());
+
+    # Stop playback (any payload)
+    - topic: ${dev_name}/rtttl/stop
+      then:
+        - rtttl.stop:
+
+    # Optional: enable/disable buzzer gate via MQTT
+    - topic: ${dev_name}/rtttl/enabled
+      then:
+        - lambda: |-
+            std::string s = x.c_str();
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+            bool on = (s == "1" || s == "on" || s == "true");
+            id(buzzer_enabled) = on;
+            id(buzzer_enable_sw).publish_state(on);
+
+    # ---- Display light on/off from MQTT (keeps HA in sync) ----
+    - topic: ${dev_name}/display/set
+      then:
+        - lambda: |-
+            const bool on = (x == "1" || x == "on" || x == "true");
+            if (on && id(tm1650_intensity) == 0) id(tm1650_intensity) = id(last_bright_steps);
+            id(display_enabled) = on;
+        - light.control:
+            id: display_light
+            state: !lambda 'return id(display_enabled);'
+            brightness: !lambda 'return id(display_enabled) ? (id(tm1650_intensity) / 7.0f) : 0.0f;'
+
+    # ---- Text / Clock renderer control ----
+    # "2"/"1"/"on" => clock ; anything else => text mode
+    - topic: ${dev_name}/DisplayClock
+      then:
+        - lambda: |-
+            std::string s = x.c_str();
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+            if (s == "2" || s == "1" || s == "on") {
+              id(disp_mode) = 0;   // clock
+              id(text_payload) = "";
+            } else {
+              id(disp_mode) = 1;   // text
+            }
+
+    # Set text payload and switch to text mode immediately
+    - topic: ${dev_name}/DisplayText
+      then:
+        - lambda: |-
+            std::string s = x.c_str();
+
+            // Left-pad with '*' if there is exactly one digit before '.' or '^' and it's not negative
+            auto is_digit = [](char c){ return c >= '0' && c <= '9'; };
+
+            size_t i = 0;
+            while (i < s.size() && s[i] == ' ') i++;        // skip leading spaces
+            bool negative = (i < s.size() && s[i] == '-');
+
+            if (!negative && i < s.size() && is_digit(s[i])) {
+              // Count digits before '.' or '^'
+              size_t j = i, digits = 0;
+              while (j < s.size() && s[j] != '.' && s[j] != '^') {
+                if (is_digit(s[j])) digits++;
+                else break;  // stop at first non-digit (e.g. unit letter)
+                j++;
+              }
+              if (digits == 1) s = "*" + s;
+            }
+
+            id(text_payload) = s;
+            id(disp_mode) = 1;
+
+# ---------- State / Settings ----------
+globals:
+  - id: mqtt_ok
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: blue_indicator_enabled
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+
+  - id: tm1650_intensity         # 0..7 (0=off)
+    type: uint8_t
+    restore_value: yes
+    initial_value: "2"
+
+  - id: display_enabled
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+
+  - id: buzzer_enabled
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+
+  - id: last_ntp_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: last_bright_steps        # last non-zero brightness 1..7
+    type: uint8_t
+    restore_value: yes
+    initial_value: "2"
+
+  # Text mode state
+  - id: disp_mode                # 0 = clock, 1 = text
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: text_payload             # last text string to render
+    type: std::string
+    restore_value: no
+    initial_value: ""
+
+
+
+# ---------- Outputs (buzzer + LEDs + display "virtual" output) ----------
+output:
+  # PWM for RTTTL tones (passive piezo, usually non-inverted)
+  - platform: esp8266_pwm
+    id: buzzer_pwm
+    pin: GPIO5
+    frequency: 1000 Hz
+    inverted: False
+
+  # Red LED (active-low) -> exposed as a LIGHT below
+  - platform: gpio
+    id: red_led_out
+    pin: GPIO2
+    inverted: true
+
+  # Blue LED (active-low) -> driven by code + override
+  - platform: gpio
+    id: blue_led_out
+    pin: GPIO0
+    inverted: true
+
+  # *** Template FLOAT output that maps a light level (0.0..1.0) to TM1650 steps (0..7) ***
+  # Percentage → step:
+  #   0–6%  → 0 (OFF)
+  #   7–21% → 1
+  #   22–35%→ 2
+  #   36–50%→ 3
+  #   51–64%→ 4
+  #   65–78%→ 5
+  #   79–92%→ 6
+  #   93–100%→7
+  - platform: template
+    id: display_logic_out
+    type: float
+    write_action:
+      - lambda: |-
+          // 'state' is 0.0..1.0 from the light slider
+          int steps = (int) round(state * 7.0f);
+          if (steps < 0) steps = 0;
+          if (steps > 7) steps = 7;
+          id(tm1650_intensity) = (uint8_t) steps;
+          id(display_enabled) = (steps > 0);
+          if (steps > 0) id(last_bright_steps) = steps;
+
+# ---------- Lights ----------
+light:
+  # Red LED as a light (no duplicate switch)
+  - platform: binary
+    id: red_led_light
+    icon: mdi:alarm-light-outline
+    name: "Red LED"
+    output: red_led_out
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # Display as ONE light with brightness slider (monochromatic -> our template output)
+  - platform: monochromatic
+    id: display_light
+    name: "Display"
+    icon: mdi:clock-digital
+    output: display_logic_out
+    default_transition_length: 0s
+    gamma_correct: 1.0
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      then:
+        - lambda: |-
+            if (id(tm1650_intensity) == 0) {
+              id(tm1650_intensity) = id(last_bright_steps);
+            }
+            id(display_enabled) = true;
+        - output.set_level:
+            id: display_logic_out
+            level: !lambda 'return id(tm1650_intensity) / 7.0f;'
+    on_turn_off:
+      then:
+        - lambda: |-
+            id(display_enabled) = false;
+            id(tm1650_intensity) = 0;
+        - output.set_level:
+            id: display_logic_out
+            level: 0.0
+
+# ---------- Diagnostics: RSSI, % signal, IP/SSID, Firmware, Restart Reason ----------
+sensor:
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi RSSI"
+    update_interval: 30s
+    entity_category: diagnostic
+    icon: mdi:wifi
+    unit_of_measurement: "dBm"
+
+  # Convert RSSI (dBm) -> signal quality %
+  - platform: template
+    id: wifi_signal_pct
+    name: "WiFi Signal"
+    entity_category: diagnostic
+    icon: mdi:wifi
+    unit_of_measurement: "%"
+    update_interval: 30s
+    lambda: |-
+      float rssi = id(wifi_rssi).state;        // typical range ~ -90..-30
+      if (isnan(rssi)) return NAN;
+      // simple quality curve: map -100..-50 dBm -> 0..100%
+      float q = 2.0f * (rssi + 100.0f);
+      if (q < 0) q = 0;
+      if (q > 100) q = 100;
+      return q;
+
+text_sensor:
+  # Firmware / build info (ESPHome version + project string if set above)
+  - platform: version
+    id: fw_version
+    name: "Firmware"
+    icon: mdi:chip
+    entity_category: diagnostic
+
+  # IP / SSID / BSSID / MAC
+  - platform: wifi_info
+    ip_address:
+      id: ip_addr
+      name: "IP Address"
+      icon: mdi:ip
+      entity_category: diagnostic
+    ssid:
+      id: wifi_ssid
+      name: "Connected SSID"
+      icon: mdi:wifi
+      entity_category: diagnostic
+    bssid:
+      id: wifi_bssid
+      name: "Connected BSSID"
+      icon: mdi:access-point
+      entity_category: diagnostic
+    mac_address:
+      id: wifi_mac
+      name: "MAC Address"
+      icon: mdi:identifier
+      entity_category: diagnostic
+
+  # Restart reason (power-on, watchdog, software reset, etc.)
+  - platform: template
+    id: restart_reason
+    name: "Restart Reason"
+    icon: mdi:restart-alert
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: |-
+      // ESP8266 Arduino core exposes a human-readable reason, e.g. "Power on", "External System"
+      return std::string(ESP.getResetReason().c_str());
+
+# ---------- Switches ----------
+switch:
+  # Buzzer safety gate
+  - platform: template
+    id: buzzer_enable_sw
+    icon: mdi:bullhorn
+    name: "Buzzer Enabled"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    lambda: "return id(buzzer_enabled);"
+    turn_on_action:
+      - lambda: 'id(buzzer_enabled) = true;'
+    turn_off_action:
+      - lambda: 'id(buzzer_enabled) = false;'
+      - rtttl.stop:
+
+  # Blue indicator override (night mode)
+  - platform: template
+    id: blue_indicator_enable
+    icon: mdi:alarm-light-outline
+    name: "Blue WiFi Indicator Enabled"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    lambda: "return id(blue_indicator_enabled);"
+    turn_on_action:
+      - lambda: 'id(blue_indicator_enabled) = true;'
+    turn_off_action:
+      - lambda: 'id(blue_indicator_enabled) = false;'
+
+# ---------- RTTTL ----------
+rtttl:
+  id: buzzer_rtttl
+  output: buzzer_pwm
+  gain: 0.8
+
+# ---------- Buttons (XY-Clock pinout preserved) ----------
+binary_sensor:
+  - platform: gpio
+    id: btn_middle_display
+    name: "Btn (Middle=Display)"
+    pin: { number: GPIO9, mode: INPUT_PULLUP, inverted: true }
+    filters: [ delayed_on: 10ms, delayed_off: 10ms ]
+    on_press:
+      then:
+        - light.toggle: display_light
+
+  - platform: gpio
+    id: btn_top_brightness
+    name: "Btn (Top=Brightness)"
+    pin: { number: GPIO10, mode: INPUT_PULLUP, inverted: true }
+    filters: [ delayed_on: 10ms, delayed_off: 10ms ]
+    on_press:
+      then:
+        # advance brightness step (0..7)
+        - lambda: |-
+            uint8_t v = id(tm1650_intensity);
+            v = (uint8_t)((v + 1) % 8);
+            id(tm1650_intensity) = v;
+            if (v > 0) id(last_bright_steps) = v;
+        # apply to the light entity so HA reflects the change
+        - if:
+            condition:
+              lambda: 'return id(tm1650_intensity) == 0;'
+            then:
+              - light.turn_off: display_light
+            else:
+              - light.turn_on:
+                  id: display_light
+                  brightness: !lambda 'return id(tm1650_intensity) / 7.0f;'
+
+  - platform: gpio
+    id: btn_bottom_buzzer_gate
+    name: "Btn (Bottom=Buzzer Enable)"
+    pin: { number: GPIO16, mode: INPUT, inverted: true }
+    filters: [ delayed_on: 10ms, delayed_off: 10ms ]
+    on_press:
+      then:
+        - switch.toggle: buzzer_enable_sw
+
+# ---------- Display driver (TM1650 over raw I2C) ----------
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          #include <Wire.h>
+
+          const uint8_t CTL0 = 0x24;   // control bytes: bit0=on, bits[6:4]=brightness 0..7
+          const uint8_t DIG0 = 0x34;   // segment bytes: seven segments + DP(bit7)
+
+          static bool inited = false;
+          static uint8_t last_ctrl = 0xFF;
+
+          // Brightness & enable
+          uint8_t ui = (uint8_t) id(tm1650_intensity);
+          if (ui > 7) ui = 7;
+          const bool DISP_ON = id(display_enabled) && (ui > 0);
+
+          // Control byte
+          uint8_t ctrl = DISP_ON ? ((ui << 4) | 0x01) : 0x00;
+
+          // Apply control if changed or first run; clear digits when turning off
+          if (!inited || ctrl != last_ctrl) {
+            for (int i = 0; i < 4; i++) {
+              Wire.beginTransmission(CTL0 + i);
+              Wire.write(ctrl);
+              Wire.endTransmission();
+            }
+            if (!inited || !DISP_ON) {
+              for (int i = 0; i < 4; i++) {
+                Wire.beginTransmission(DIG0 + i);
+                Wire.write(0x00);
+                Wire.endTransmission();
+              }
+            }
+            last_ctrl = ctrl;
+            inited = true;
+          }
+
+          // Timers
+          const bool BLINK_500 = ((millis() / 500)  % 2) == 0;  // 2 Hz
+          const bool COLON_ON  = ((millis() / 1000) % 2) == 0;  // 1 Hz
+
+          // Internet heuristic: recent NTP (15 min) OR MQTT connected
+          const uint32_t now_ms = millis();
+          const bool ntp_recent = (id(last_ntp_ms) != 0) && (now_ms - id(last_ntp_ms) < 15UL * 60UL * 1000UL);
+          const bool internet_ok = (ntp_recent || id(mqtt_ok));
+
+          // Blue LED: flash when internet_ok AND override enabled
+          const bool blue_ok = internet_ok && id(blue_indicator_enabled);
+          if (blue_ok) {
+            if (BLINK_500) id(blue_led_out).turn_on();
+            else           id(blue_led_out).turn_off();
+          } else {
+            id(blue_led_out).turn_off();
+          }
+
+          // If display is off, stop here
+          if (!DISP_ON) return;
+
+          // ------------- RENDERER -------------
+
+          // 7-seg digits (A..G), DP is bit7
+          static const uint8_t DIGITS[10] = {
+            0x3F, /*0*/ 0x06, /*1*/ 0x5B, /*2*/ 0x4F, /*3*/
+            0x66, /*4*/ 0x6D, /*5*/ 0x7D, /*6*/ 0x07, /*7*/
+            0x7F, /*8*/ 0x6F  /*9*/
+          };
+
+          // Full 7-seg map: digits, symbols, and letters used for FIRE / GAS / H2O / CO / CO2
+          auto seg_for_char = [](char c) -> uint8_t {
+            switch (c) {
+              // digits
+              case '0': return 0x3F;
+              case '1': return 0x06;
+              case '2': return 0x5B;
+              case '3': return 0x4F;
+              case '4': return 0x66;
+              case '5': return 0x6D;
+              case '6': return 0x7D;
+              case '7': return 0x07;
+              case '8': return 0x7F;
+              case '9': return 0x6F;
+
+              // symbols
+              case '-': return 0x40;   // minus
+              case ' ': return 0x00;   // blank
+              case '_': return 0x08;   // underscore (segment D)
+
+              // letters commonly needed
+              case 'A': case 'a': return 0x77;  // A
+              case 'C': case 'c': return 0x39;  // C
+              case 'E': case 'e': return 0x79;  // E
+              case 'F': case 'f': return 0x71;  // F
+              case 'G': case 'g': return 0x3D;  // G (approx)
+              case 'H': case 'h': return 0x76;  // H
+              case 'I': case 'i': return 0x06;  // I (looks like "1")
+              case 'O': case 'o': return 0x3F;  // O (same as 0)
+              case 'P': case 'p': return 0x73;  // P
+              case 'R': case 'r': return 0x50;  // r (approx for R)
+              case 'S': case 's': return 0x6D;  // S (same as 5)
+
+              default: return 0x00;   // unsupported -> blank
+            }
+          };
+
+          // ---------- TEXT MODE ----------
+          if (id(disp_mode) == 1) {
+            if (id(text_payload).empty()) {
+              id(disp_mode) = 0;  // nothing to show, back to clock
+            } else {
+              const std::string& s = id(text_payload);
+
+              bool want_degree = false;
+              for (char c : s) if (c == '^') { want_degree = true; break; }
+
+              const int max_digits = want_degree ? 3 : 4;  // reserve digit 4 for ° if needed
+
+              uint8_t seg[4] = {0,0,0,0};
+              bool    dp[4]  = {false,false,false,false};
+
+              int out = 0;
+              for (size_t i = 0; i < s.size() && out < max_digits; i++) {
+                char ch = s[i];
+                if (ch == '.') { if (out > 0) dp[out-1] = true; continue; }  // decimal point
+                if (ch == '^') { continue; }                                 // degree handled later
+                if (ch == '*') ch = ' ';                                     // explicit blank
+                seg[out++] = seg_for_char(ch);
+              }
+
+              // Degree symbol in 4th digit (A+B+F+G)
+              if (want_degree) {
+                const uint8_t DEGREE = 0x63;
+                seg[3] = DEGREE;
+                dp[3]  = false;
+              }
+
+              // Emit all 4 digits
+              for (int i = 0; i < 4; i++) {
+                uint8_t raw = seg[i] & 0x7F;
+                if (dp[i]) raw |= 0x80;
+                Wire.beginTransmission(DIG0 + i);
+                Wire.write(raw);
+                Wire.endTransmission();
+              }
+              return;  // finished text mode
+            }
+          }
+
+          // ---------- CLOCK MODE ----------
+          ESPTime t = id(tm_hass).now();
+          if (!t.is_valid()) t = id(tm_ntp).now();
+
+          char hhmm[5];
+          t.strftime(hhmm, sizeof(hhmm), "%H%M");
+
+          for (int i = 0; i < 4; i++) {
+            uint8_t d = (hhmm[i] >= '0' && hhmm[i] <= '9') ? (hhmm[i] - '0') : 0;
+            uint8_t raw = DIGITS[d] & 0x7F;
+            if (COLON_ON && (i == 2 || i == 3)) raw |= 0x80;  // colon blink
+            Wire.beginTransmission(DIG0 + i);
+            Wire.write(raw);
+            Wire.endTransmission();
+          }
